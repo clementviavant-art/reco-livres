@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from groq import Groq
 
-# Initialisation du client Groq avec les secrets Streamlit
+# Initialisation sécurisée du client Groq avec les secrets Streamlit
 try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 except Exception as e:
@@ -10,7 +10,16 @@ except Exception as e:
 
 st.title("📚 Mon Recommandeur de Livres")
 
-# Chargement de la base Notion
+# Bloc optionnel de diagnostic (permet d'afficher vos modèles disponibles en un clic)
+if st.checkbox("🔍 Afficher les modèles Groq disponibles sur mon compte"):
+    try:
+        models = client.models.list()
+        model_ids = [m.id for m in models.data]
+        st.write(model_ids)
+    except Exception as e:
+        st.error(f"Impossible de récupérer la liste des modèles : {e}")
+
+# Chargement de la base Notion avec sécurité
 @st.cache_data
 def load_data():
     try:
@@ -21,9 +30,11 @@ def load_data():
 df_livres = load_data()
 
 if df_livres is not None:
+    # Optionnel : Afficher un aperçu de la liste
     if st.checkbox("Voir la liste des livres disponibles"):
         st.dataframe(df_livres)
 
+    # Interface utilisateur
     user_query = st.text_input("Quel genre de livre recherchez-vous ou quelle est votre humeur actuelle ?")
     
     if st.button("Obtenir des recommandations"):
@@ -40,9 +51,9 @@ if df_livres is not None:
                 """
                 
                 try:
-                    # Appel de l'IA via Groq (Llama 3 70B, extrêmement rapide et performant)
+                    # Appel de l'IA via Groq avec le modèle stable
                     completion = client.chat.completions.create(
-                        model="llama3-8b-8192",
+                        model="llama-3.3-70b-versatile",
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.7,
                     )
@@ -52,4 +63,4 @@ if df_livres is not None:
         else:
             st.warning("Veuillez entrer une demande.")
 else:
-    st.error("Le fichier `livres.csv` est introuvable sur votre dépôt GitHub.")
+    st.error("Le fichier `livres.csv` est introuvable sur votre dépôt GitHub. Veuillez vous assurer qu'il est bien présent à la racine.")
