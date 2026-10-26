@@ -1,16 +1,16 @@
 import streamlit as st
 import pandas as pd
-from google import genai
+from groq import Groq
 
-# Initialisation du client avec la nouvelle bibliothèque officielle
+# Initialisation du client Groq avec les secrets Streamlit
 try:
-    client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
+    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 except Exception as e:
-    st.error(f"Erreur de configuration de la clé API : {e}")
+    st.error(f"Erreur de configuration de la clé API Groq : {e}")
 
 st.title("📚 Mon Recommandeur de Livres")
 
-# Chargement de la base Notion avec sécurité
+# Chargement de la base Notion
 @st.cache_data
 def load_data():
     try:
@@ -21,11 +21,9 @@ def load_data():
 df_livres = load_data()
 
 if df_livres is not None:
-    # Optionnel : Afficher un aperçu de la liste
     if st.checkbox("Voir la liste des livres disponibles"):
         st.dataframe(df_livres)
 
-    # Interface utilisateur
     user_query = st.text_input("Quel genre de livre recherchez-vous ou quelle est votre humeur actuelle ?")
     
     if st.button("Obtenir des recommandations"):
@@ -42,15 +40,16 @@ if df_livres is not None:
                 """
                 
                 try:
-                    # Appel de l'IA avec la nouvelle syntaxe et le modèle stable
-                    response = client.models.generate_content(
-                        model='gemini-3.8-flash',
-                        contents=prompt,
+                    # Appel de l'IA via Groq (Llama 3 70B, extrêmement rapide et performant)
+                    completion = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.7,
                     )
-                    st.markdown(response.text)
+                    st.markdown(completion.choices[0].message.content)
                 except Exception as e:
                     st.error(f"Erreur lors de l'appel à l'IA : {e}")
         else:
             st.warning("Veuillez entrer une demande.")
 else:
-    st.error("Le fichier `livres.csv` est introuvable sur votre dépôt GitHub. Veuillez vous assurer qu'il est bien présent à la racine.")
+    st.error("Le fichier `livres.csv` est introuvable sur votre dépôt GitHub.")
