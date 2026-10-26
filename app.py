@@ -177,20 +177,24 @@ CATALOGUE COMPLET :
 ID|Auteur|Titre
 {catalogue}
 
-CONSIGNES :
-- Choisis uniquement des livres présents dans le catalogue.
-- Utilise leurs identifiants exacts.
-- Privilégie les livres qui correspondent le mieux aux envies du lecteur.
-- Ne recommande pas plusieurs fois le même livre.
-- Donne une justification courte et personnalisée pour chaque choix.
-- Si les préférences sont vagues, choisis des livres variés et intéressants.
-- N'invente ni titre ni auteur.
-- Réponds uniquement avec une ligne par livre, sans introduction ni conclusion.
-- Respecte exactement ce format :
-ID: identifiant | raison : justification courte
+Ta mission :
+1. Sélectionne 3 livres du catalogue qui correspondent aux envies du lecteur.
+2. Propose obligatoirement une 4e recommandation extérieure au catalogue.
+3. Cette 4e recommandation doit être un livre réel, publié et pertinent pour le lecteur.
+4. Ne choisis pas pour la 4e recommandation un livre déjà présent dans le catalogue.
+5. N'invente aucun titre ni auteur. Si tu as un doute sur l'existence d'un livre, choisis-en un autre.
+6. Pour chaque livre, donne une justification courte et personnalisée.
 
-Exemple de format uniquement :
-ID: identifiant | raison : ce livre pourrait te plaire parce que...
+Réponds uniquement avec 4 lignes, dans ce format exact :
+
+ID: identifiant | raison : justification
+ID: identifiant | raison : justification
+ID: identifiant | raison : justification
+EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
+
+Pour les trois premières lignes, utilise exclusivement les identifiants du catalogue.
+Pour la dernière ligne, indique le titre et l'auteur d'un livre absent du catalogue.
+N'ajoute aucun texte avant ou après ces lignes.
 """
 
     response = client.chat.completions.create(
