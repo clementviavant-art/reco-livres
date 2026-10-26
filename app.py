@@ -1,4 +1,3 @@
-```python
 import re
 import unicodedata
 from pathlib import Path
