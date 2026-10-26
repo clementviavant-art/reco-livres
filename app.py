@@ -10,7 +10,7 @@ except Exception as e:
 
 st.title("📚 Mon Recommandeur de Livres")
 
-# Bloc optionnel de diagnostic (permet d'afficher vos modèles disponibles en un clic)
+# Bloc optionnel de diagnostic (peut être masqué ou supprimé maintenant)
 if st.checkbox("🔍 Afficher les modèles Groq disponibles sur mon compte"):
     try:
         models = client.models.list()
@@ -40,10 +40,11 @@ if df_livres is not None:
     if st.button("Obtenir des recommandations"):
         if user_query:
             with st.spinner("L'IA analyse la bibliothèque..."):
-                contexte_livres = df_livres.to_string(index=False)
+                # On limite aux 150 premiers livres pour respecter la limite de tokens gratuite (ITPM)
+                contexte_livres = df_livres.head(150).to_string(index=False)
                 
                 prompt = f"""
-                Tu es un bibliothécaire expert. Voici la liste des livres disponibles dans ma bibliothèque :
+                Tu es un bibliothécaire expert. Voici une sélection des livres disponibles dans ma bibliothèque :
                 {contexte_livres}
                 
                 En te basant uniquement ou prioritairement sur cette liste, recommande 3 livres qui correspondent à la demande suivante : "{user_query}".
@@ -51,7 +52,7 @@ if df_livres is not None:
                 """
                 
                 try:
-                    # Appel de l'IA via Groq avec le modèle présent dans votre liste
+                    # Appel de l'IA via Groq avec le modèle Qwen validé
                     completion = client.chat.completions.create(
                         model="qwen/qwen3.8-27b",
                         messages=[{"role": "user", "content": prompt}],
