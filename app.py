@@ -30,17 +30,21 @@ if df_livres is not None:
         if user_query:
             with st.spinner("L'IA analyse la bibliothèque..."):
                 
-                # ASTUCE ANTI-SATURATION : On ne garde que les colonnes utiles (adaptez les noms selon votre CSV si besoin, ex: "Titre", "Auteur")
-                colonnes_utiles = [col for col in ["Titre", "Auteur", "Genre", "Nom", "Author"] if col in df_livres.columns]
-                if colonnes_utiles:
-                    df_reduit = df_livres[colonnes_utiles]
-                else:
-                    df_reduit = df_livres.iloc[:, :3] # Prend les 3 premières colonnes par défaut
+                # 1. Détection intelligente des colonnes Titre et Auteur
+                col_titre = next((col for col in ["Titre", "Nom", "Title", "Name"] if col in df_livres.columns), df_livres.columns[0])
+                col_auteur = next((col for col in ["Auteur", "Author"] if col in df_livres.columns), None)
                 
-                contexte_livres = df_reduit.to_string(index=False)
+                # 2. Formatage ultra-léger ligne par ligne (ex: "- Le Petit Prince par Antoine de Saint-Exupéry")
+                if col_auteur:
+                    liste_livres = [f"- {row[col_titre]} (par {row[col_auteur]})" for _, row in df_livres.iterrows()]
+                else:
+                    liste_livres = [f"- {row[col_titre]}" for _, row in df_livres.iloc[:, 0].items()]
+                
+                # On joint l'ensemble avec des sauts de ligne
+                contexte_livres = "\n".join(liste_livres)
                 
                 prompt = f"""
-                Tu es un bibliothécaire expert. Voici la liste des livres de ma bibliothèque :
+                Tu es un bibliothécaire expert. Voici la liste des livres disponibles dans ma bibliothèque :
                 {contexte_livres}
                 
                 En te basant sur cette liste, recommande 3 livres qui correspondent à la demande suivante : "{user_query}".
