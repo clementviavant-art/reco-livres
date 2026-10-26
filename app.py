@@ -51,9 +51,9 @@ if df_livres is not None:
                 """
                 
                 try:
-                    # Appel de l'IA via Groq avec le modèle stable
+                    # Appel de l'IA via Groq avec le modèle présent dans votre liste
                     completion = client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                        model="qwen/qwen3.8-27b",
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.7,
                     )
