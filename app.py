@@ -33,22 +33,60 @@ except Exception:
 
 @st.cache_data
 def load_data():
-    try:
-        data = pd.read_csv("livres.csv", dtype=str).fillna("")
-        data.columns = data.columns.str.strip()
-        return data
-    except FileNotFoundError:
+    import csv
+    from pathlib import Path
+
+    path = Path("livres.csv")
+
+    if not path.exists():
         return None
 
-df = load_data()
+    erreurs = []
 
-if df is None:
-    st.error("Le fichier livres.csv est introuvable.")
-    st.stop()
+    # Essayer les encodages courants
+    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            with open(path, "r", encoding=encoding, newline="") as f:
+                sample = f.read(16384)
 
-if df.empty or len(df.columns) == 0:
-    st.error("Le fichier livres.csv est vide.")
-    st.stop()
+            if not sample.strip():
+                raise ValueError("Le fichier est vide.")
+
+            # Détecter le séparateur
+            try:
+                dialect = csv.Sniffer().sniff(
+                    sample, delimiters=";,\t|"
+                )
+                separator = dialect.delimiter
+            except csv.Error:
+                # Le point-virgule est courant dans les CSV français
+                separator = ";"
+
+            data = pd.read_csv(
+                path,
+                sep=separator,
+                encoding=encoding,
+                dtype=str,
+                keep_default_na=False,
+                engine="python",
+                on_bad_lines="error",
+            )
+
+            data.columns = data.columns.str.strip()
+            return data
+
+        except (UnicodeDecodeError, pd.errors.ParserError, ValueError) as e:
+            erreurs.append(f"{encoding}: {e}")
+
+    st.error(
+        "Impossible de lire livres.csv. Vérifie le séparateur, "
+        "les guillemets et les lignes mal formées."
+    )
+
+    with st.expander("Détails techniques"):
+        st.code("\n".join(erreurs))
+
+    return None
 
 # ---------------- DETECTION DES COLONNES ----------------
 
