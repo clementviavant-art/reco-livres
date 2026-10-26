@@ -146,7 +146,7 @@ if st.button("Obtenir des recommandations", type="primary"):
                 ],
                 temperature=0.2,
                 max_completion_tokens=MAX_COMPLETION_TOKENS,
-                reasoning_effort="none",
+                reasoning_effort="medium",
             )
 
             result = completion.choices[0].message.content
