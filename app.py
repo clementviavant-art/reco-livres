@@ -156,20 +156,17 @@ Les identifiants doivent exister dans le catalogue."""
                     {
                         "role": "system",
                         "content": (
-                            "Tu recommandes des livres avec discernement. "
-                            "Privilégie la pertinence, l'honnêteté et "
-                            "les correspondances littéraires réelles."
+                            "Tu es un bibliothécaire expert. "
+                            "Choisis uniquement des livres du catalogue fourni."
                         ),
                     },
                     {"role": "user", "content": prompt},
                 ],
                 temperature=1,
-                max_completion_tokens=MAX_COMPLETION_TOKENS,
+                max_completion_tokens=1200,
                 reasoning_effort="medium",
                 reasoning_format="hidden",
-                response_format={"type": "json_object"},
-            )
-
+            )            
             content = response.choices[0].message.content
 
             if not content:
