@@ -24,7 +24,7 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("📚 Mon conseiller de lecture")
+st.title("📚 On lit quoi ce soir ??")
 st.write("Décris tes envies de lecture : l'IA choisira des livres dans ton catalogue.")
 
 
