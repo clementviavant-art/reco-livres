@@ -1,244 +1,293 @@
-import json
+
+import os
+import re
 import streamlit as st
 import pandas as pd
 from groq import Groq
 
-# ---------------- CONFIGURATION ----------------
+# -----------------------------
+# CONFIGURATION
+# -----------------------------
 
 MODEL = "qwen/qwen3.8-27b"
-MAX_COMPLETION_TOKENS = 1200
+CSV_FILE = "livres.csv"
+MAX_RECOMMENDATIONS = 3
+
+
+# -----------------------------
+# PAGE
+# -----------------------------
 
 st.set_page_config(
-    page_title="Mon recommandeur de livres",
+    page_title="Conseiller de lecture",
     page_icon="📚",
-    layout="centered",
+    layout="centered"
 )
 
-st.title("📚 Mon recommandeur de livres")
+st.title("📚 Mon conseiller de lecture")
+st.write("Décris tes envies de lecture : l'IA choisira des livres dans ton catalogue.")
 
-# ---------------- CONNEXION GROQ ----------------
 
-try:
-    client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-except Exception:
-    st.error(
-        "Clé API Groq absente ou inaccessible. "
-        "Vérifie les secrets de ton application."
-    )
-    st.stop()
-
-# ---------------- CHARGEMENT DU CSV ----------------
+# -----------------------------
+# LOAD THE CSV
+# -----------------------------
 
 @st.cache_data
-def load_data():
-    try:
-        data = pd.read_csv(
-            "livres.csv",
-            sep=";",
-            encoding="utf-8-sig",
-            dtype=str,
-            keep_default_na=False,
+def load_books():
+    # Le fichier fourni utilise un point-virgule et un encodage UTF-8 avec BOM.
+    df = pd.read_csv(
+        CSV_FILE,
+        sep=";",
+        encoding="utf-8-sig",
+        dtype=str,
+        keep_default_na=False
+    )
+
+    # Nettoyage des noms de colonnes
+    df.columns = [col.strip() for col in df.columns]
+
+    # Vérification des colonnes attendues
+    required_columns = ["Auteur", "Titre du livre"]
+    missing = [col for col in required_columns if col not in df.columns]
+
+    if missing:
+        raise ValueError(
+            "Colonnes manquantes : "
+            + ", ".join(missing)
+            + ". Colonnes trouvées : "
+            + ", ".join(df.columns)
         )
 
-        data.columns = data.columns.str.strip()
+    # Nettoyage des données
+    df["Auteur"] = df["Auteur"].str.strip()
+    df["Titre du livre"] = df["Titre du livre"].str.strip()
 
-        # Vérification des colonnes du fichier fourni
-        required = ["Auteur", "Titre du livre"]
-        missing = [col for col in required if col not in data.columns]
+    # Retirer les lignes sans titre
+    df = df[df["Titre du livre"] != ""].copy()
 
-        if missing:
-            raise ValueError(
-                "Colonnes manquantes : " + ", ".join(missing)
-            )
+    # Identifiant simple pour retrouver chaque livre
+    df = df.reset_index(drop=True)
+    df["_id"] = df.index.astype(str)
 
-        # Nettoyage des données
-        data["Auteur"] = data["Auteur"].str.strip()
-        data["Titre du livre"] = data["Titre du livre"].str.strip()
-
-        data = data[
-            data["Titre du livre"].ne("")
-        ].copy()
-
-        # Identifiant propre à chaque ligne
-        data = data.reset_index(drop=True)
-        data["_id"] = data.index.map(str)
-
-        return data
-
-    except FileNotFoundError:
-        st.error("Le fichier livres.csv est introuvable.")
-        return None
-    except Exception as e:
-        st.error(f"Erreur de lecture du CSV : {e}")
-        return None
+    return df
 
 
-df = load_data()
-
-if df is None:
+try:
+    books = load_books()
+except FileNotFoundError:
+    st.error(
+        f"Impossible de trouver {CSV_FILE}. "
+        "Place livres.csv dans le même dossier que app.py."
+    )
+    st.stop()
+except Exception as e:
+    st.error(f"Erreur lors de la lecture du fichier CSV : {e}")
     st.stop()
 
-if df.empty:
-    st.error("Aucun livre trouvé dans le fichier CSV.")
+if books.empty:
+    st.error("Le fichier CSV ne contient aucun livre avec un titre.")
     st.stop()
 
-# ---------------- BIBLIOTHEQUE ----------------
+st.caption(f"📖 {len(books)} livres disponibles dans le catalogue.")
 
-st.caption(f"📚 {len(df)} livres disponibles")
 
-if st.checkbox("Voir la liste des livres"):
-    st.dataframe(
-        df[["Auteur", "Titre du livre"]],
-        use_container_width=True,
-        hide_index=True,
+# -----------------------------
+# API KEY
+# -----------------------------
+
+try:
+    api_key = st.secrets.get("GROQ_API_KEY", "")
+except Exception:
+    api_key = ""
+
+# Possibilité d'utiliser une variable d'environnement
+if not api_key:
+    api_key = os.getenv("GROQ_API_KEY", "")
+
+if not api_key:
+    st.error(
+        "La clé API Groq est introuvable. "
+        "Configure GROQ_API_KEY dans le fichier .streamlit/secrets.toml."
     )
-
-# ---------------- CONSTRUCTION DU CATALOGUE ----------------
-
-def build_catalogue(data):
-    # Une ligne compacte par livre : ID|auteur|titre
-    return "\n".join(
-        f"{row['_id']}|{row['Auteur'] or '?'}|{row['Titre du livre']}"
-        for _, row in data.iterrows()
-    )
+    st.stop()
 
 
-catalogue = build_catalogue(df)
+# -----------------------------
+# USER PREFERENCES
+# -----------------------------
 
-# ---------------- DEMANDE UTILISATEUR ----------------
-
-user_query = st.text_input(
-    "Quel genre de livre recherches-tu ou quelle est ton humeur ?",
-    placeholder="Ex. : un polar sombre avec une intrigue psychologique",
-    max_chars=500,
+preferences = st.text_area(
+    "Qu'as-tu envie de lire ?",
+    placeholder=(
+        "Exemple : un roman captivant, avec du suspense, "
+        "des personnages complexes, sans science-fiction..."
+    ),
+    height=120
 )
 
-if st.button("Obtenir mes recommandations", type="primary"):
+avoid = st.text_input(
+    "Ce que tu veux éviter (facultatif)",
+    placeholder="Ex. : romance, violence, livres trop longs..."
+)
 
-    if not user_query.strip():
-        st.warning("Décris le livre que tu recherches.")
-        st.stop()
+submitted = st.button(
+    "Trouver des livres",
+    type="primary",
+    use_container_width=True
+)
 
-    prompt = f"""Tu es un libraire expert et exigeant.
 
-DEMANDE DU LECTEUR :
-{user_query.strip()}
+# -----------------------------
+# BUILD A COMPACT CATALOGUE
+# -----------------------------
 
-BIBLIOTHÈQUE COMPLÈTE (ID|auteur|titre) :
+def build_catalogue(df):
+    lines = []
+
+    for _, book in df.iterrows():
+        author = book["Auteur"].replace("\n", " ").replace("|", "/")
+        title = book["Titre du livre"].replace("\n", " ").replace("|", "/")
+
+        # Format compact : identifiant | auteur | titre
+        lines.append(f'{book["_id"]}|{author}|{title}')
+
+    return "\n".join(lines)
+
+
+# -----------------------------
+# ASK GROQ
+# -----------------------------
+
+def recommend_books(preferences, avoid, df):
+    client = Groq(api_key=api_key)
+
+    catalogue = build_catalogue(df)
+
+    prompt = f"""
+Tu es un conseiller littéraire.
+Choisis au maximum {MAX_RECOMMENDATIONS} livres dans le catalogue fourni.
+
+ENVIES DU LECTEUR :
+{preferences}
+
+À ÉVITER :
+{avoid if avoid.strip() else "Rien de précisé"}
+
+CATALOGUE COMPLET :
+ID|Auteur|Titre
 {catalogue}
 
-MISSION :
-Sélectionne jusqu'à 3 livres réellement présents dans cette liste.
-Classe-les du plus pertinent au moins pertinent.
-Prends en compte le genre, l'ambiance, les thèmes, le rythme
-et les attentes implicites du lecteur.
-Compare les livres entre eux avant de choisir.
-Ne choisis pas un livre uniquement parce que son titre contient
-un mot similaire à la demande.
-N'invente ni titre, ni auteur, ni intrigue.
-Le catalogue ne contient que les auteurs et titres :
-si tu ne connais pas suffisamment un livre, indique cette limite.
-Si aucun livre ne correspond raisonnablement, retourne une liste vide.
+CONSIGNES :
+- Choisis uniquement des livres présents dans le catalogue.
+- Utilise leurs identifiants exacts.
+- Privilégie les livres qui correspondent le mieux aux envies du lecteur.
+- Ne recommande pas plusieurs fois le même livre.
+- Donne une justification courte et personnalisée pour chaque choix.
+- Si les préférences sont vagues, choisis des livres variés et intéressants.
+- N'invente ni titre ni auteur.
+- Réponds uniquement avec une ligne par livre, sans introduction ni conclusion.
+- Respecte exactement ce format :
+ID: identifiant | raison : justification courte
 
-Retourne uniquement un JSON valide au format :
-{{"recommendations":[
-  {{"id":"ID exact","reason":"Justification concise",
-    "confidence":"élevée|moyenne|faible"}}
-]}}
-Les identifiants doivent exister dans le catalogue."""
+Exemple de format uniquement :
+ID: identifiant | raison : ce livre pourrait te plaire parce que...
+"""
 
-    with st.spinner("Analyse de toute la bibliothèque..."):
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Tu es un conseiller littéraire précis. "
+                    "Tu dois sélectionner les livres uniquement dans "
+                    "le catalogue fourni et respecter le format demandé."
+                )
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0.6,
+        max_completion_tokens=1000
+    )
 
+    return response.choices[0].message.content or ""
+
+
+# -----------------------------
+# VALIDATE THE RECOMMENDATIONS
+# -----------------------------
+
+def parse_recommendations(answer, df):
+    # On ne fait confiance qu'aux identifiants réellement présents dans le CSV.
+    books_by_id = df.set_index("_id", drop=False)
+
+    # Accepte par exemple :
+    # ID: 12 | raison : Ce roman est captivant.
+    pattern = re.compile(
+        r"^\s*ID\s*:\s*(\d+)\s*\|\s*raison\s*:\s*(.+?)\s*$",
+        flags=re.IGNORECASE | re.MULTILINE
+    )
+
+    matches = pattern.findall(answer)
+    recommendations = []
+    seen_ids = set()
+
+    for book_id, reason in matches:
+        if book_id not in books_by_id.index:
+            continue
+
+        if book_id in seen_ids:
+            continue
+
+        seen_ids.add(book_id)
+        book = books_by_id.loc[book_id]
+
+        recommendations.append({
+            "titre": book["Titre du livre"],
+            "auteur": book["Auteur"],
+            "raison": reason.strip()
+        })
+
+        if len(recommendations) >= MAX_RECOMMENDATIONS:
+            break
+
+    return recommendations
+
+
+# -----------------------------
+# DISPLAY RESULTS
+# -----------------------------
+
+if submitted:
+    if not preferences.strip():
+        st.warning("Décris un peu tes envies de lecture avant de lancer la recherche.")
+        st.stop()
+
+    with st.spinner("Je parcours le catalogue et cherche les livres qui te correspondent..."):
         try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Tu es un bibliothécaire expert. "
-                            "Choisis uniquement des livres du catalogue fourni."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=1,
-                max_completion_tokens=1200,
-                reasoning_effort="medium",
-                reasoning_format="hidden",
-            )            
-            content = response.choices[0].message.content
+            answer = recommend_books(preferences, avoid, books)
+            recommendations = parse_recommendations(answer, books)
 
-            if not content:
-                st.warning("Le modèle n'a retourné aucune réponse.")
-                st.stop()
-
-            result = json.loads(content)
-            recommendations = result.get("recommendations", [])
-
-            # Vérification des identifiants et récupération des
-            # titres/auteurs directement depuis le CSV
-            books_by_id = df.set_index("_id")
-            seen = set()
-            valid = []
-
-            for item in recommendations:
-                if not isinstance(item, dict):
-                    continue
-
-                book_id = str(item.get("id", "")).strip()
-
-                if book_id not in books_by_id.index or book_id in seen:
-                    continue
-
-                seen.add(book_id)
-                book = books_by_id.loc[book_id]
-
-                valid.append({
-                    "auteur": book["Auteur"],
-                    "titre": book["Titre du livre"],
-                    "raison": str(item.get("reason", "")).strip(),
-                    "confiance": str(
-                        item.get("confidence", "non précisée")
-                    ).strip(),
-                })
-
-                if len(valid) == 3:
-                    break
-
-            if not valid:
+            if not recommendations:
                 st.warning(
-                    "Aucune recommandation suffisamment pertinente. "
-                    "Essaie de préciser le genre ou l'ambiance recherchée."
+                    "L'IA n'a pas renvoyé de recommandations dans le format attendu. "
+                    "Réessaie. Si le problème persiste, vérifie le modèle Groq utilisé."
                 )
+
+                with st.expander("Voir la réponse brute de l'IA"):
+                    st.text(answer)
+
             else:
-                st.subheader("Tes recommandations")
+                st.subheader("📚 Voici ma sélection")
 
-                for i, book in enumerate(valid, start=1):
+                for i, book in enumerate(recommendations, start=1):
                     st.markdown(f"### {i}. {book['titre']}")
-                    st.write(f"**Auteur :** {book['auteur'] or 'Non renseigné'}")
+                    st.write(f"**Auteur :** {book['auteur']}")
+                    st.write(book["raison"])
+                    st.divider()
 
-                    if book["raison"]:
-                        st.write(book["raison"])
-
-                    st.caption(
-                        f"Confiance estimée : {book['confiance']}"
-                    )
-
-            # ---------------- SUIVI DES TOKENS ----------------
-
-            usage = response.usage
-
-            if usage:
-                st.divider()
-                st.caption(
-                    f"Livres transmis : {len(df)} · "
-                    f"Tokens en entrée : {usage.prompt_tokens:,} · "
-                    f"Tokens en sortie : {usage.completion_tokens:,} · "
-                    f"Total : {usage.total_tokens:,}"
-                )
-
-        except json.JSONDecodeError:
-            st.error("La réponse de l'IA n'est pas un JSON valide.")
         except Exception as e:
-            st.error(f"Erreur lors de l'appel à Groq : {e}")
+            st.error(f"Une erreur est survenue lors de l'appel à Groq : {e}")
