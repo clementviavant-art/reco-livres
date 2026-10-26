@@ -44,7 +44,7 @@ if df_livres is not None:
                 try:
                     # Appel de l'IA avec la nouvelle syntaxe et le modèle stable
                     response = client.models.generate_content(
-                        model='gemini-2.0-flash',
+                        model='gemini-3.8-flash',
                         contents=prompt,
                     )
                     st.markdown(response.text)
