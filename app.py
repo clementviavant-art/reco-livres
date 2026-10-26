@@ -140,13 +140,12 @@ if st.button("Obtenir des recommandations", type="primary"):
 
         try:
             completion = client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_completion_tokens=MAX_COMPLETION_TOKENS,
+                model="qwen/qwen3.8-27b",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.5,
+                max_completion_tokens=350,
                 reasoning_effort="medium",
+                reasoning_format="hidden",
             )
 
             result = completion.choices[0].message.content
