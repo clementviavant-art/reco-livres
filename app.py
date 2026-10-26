@@ -26,7 +26,7 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("📚 Mon conseiller de lecture")
+st.title("Conseiller spécial pour la famille Viavant")
 st.write(
     "Trouve tes prochaines lectures parmi tes livres, "
     "avec en bonus une découverte extérieure à ta bibliothèque."
