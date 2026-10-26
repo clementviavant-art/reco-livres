@@ -1,17 +1,16 @@
 import streamlit as st
 import pandas as pd
-import google.generativeai as genai
+from google import genai
 
-# 1. Configuration sécurisée de la clé API
-GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
-genai.configure(api_key=GOOGLE_API_KEY)
-
-# 2. Utilisation directe du modèle stable
-model = genai.GenerativeModel('gemini-2.0-flash')
+# Initialisation du client avec la nouvelle bibliothèque officielle
+try:
+    client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
+except Exception as e:
+    st.error(f"Erreur de configuration de la clé API : {e}")
 
 st.title("📚 Mon Recommandeur de Livres")
 
-# Chargement de la base Notion avec gestion d'erreur
+# Chargement de la base Notion avec sécurité
 @st.cache_data
 def load_data():
     try:
@@ -42,8 +41,15 @@ if df_livres is not None:
                 Pour chaque livre, donne le titre, l'auteur et explique brièvement pourquoi il correspond à la demande.
                 """
                 
-                response = model.generate_content(prompt)
-                st.markdown(response.text)
+                try:
+                    # Appel de l'IA avec la nouvelle syntaxe et le modèle stable
+                    response = client.models.generate_content(
+                        model='gemini-2.0-flash',
+                        contents=prompt,
+                    )
+                    st.markdown(response.text)
+                except Exception as e:
+                    st.error(f"Erreur lors de l'appel à l'IA : {e}")
         else:
             st.warning("Veuillez entrer une demande.")
 else:
