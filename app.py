@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 from groq import Groq
 
-# Initialisation sécurisée du client Groq avec les secrets Streamlit
+# Initialisation sécurisée
 try:
     client = Groq(api_key=st.secrets["GROQ_API_KEY"])
 except Exception as e:
@@ -10,16 +10,7 @@ except Exception as e:
 
 st.title("📚 Mon Recommandeur de Livres")
 
-# Bloc optionnel de diagnostic (peut être masqué ou supprimé maintenant)
-if st.checkbox("🔍 Afficher les modèles Groq disponibles sur mon compte"):
-    try:
-        models = client.models.list()
-        model_ids = [m.id for m in models.data]
-        st.write(model_ids)
-    except Exception as e:
-        st.error(f"Impossible de récupérer la liste des modèles : {e}")
-
-# Chargement de la base Notion avec sécurité
+# Chargement de la base Notion
 @st.cache_data
 def load_data():
     try:
@@ -30,29 +21,33 @@ def load_data():
 df_livres = load_data()
 
 if df_livres is not None:
-    # Optionnel : Afficher un aperçu de la liste
     if st.checkbox("Voir la liste des livres disponibles"):
         st.dataframe(df_livres)
 
-    # Interface utilisateur
     user_query = st.text_input("Quel genre de livre recherchez-vous ou quelle est votre humeur actuelle ?")
     
     if st.button("Obtenir des recommandations"):
         if user_query:
             with st.spinner("L'IA analyse la bibliothèque..."):
-                # On limite aux 150 premiers livres pour respecter la limite de tokens gratuite (ITPM)
-                contexte_livres = df_livres.head(150).to_string(index=False)
+                
+                # ASTUCE ANTI-SATURATION : On ne garde que les colonnes utiles (adaptez les noms selon votre CSV si besoin, ex: "Titre", "Auteur")
+                colonnes_utiles = [col for col in ["Titre", "Auteur", "Genre", "Nom", "Author"] if col in df_livres.columns]
+                if colonnes_utiles:
+                    df_reduit = df_livres[colonnes_utiles]
+                else:
+                    df_reduit = df_livres.iloc[:, :3] # Prend les 3 premières colonnes par défaut
+                
+                contexte_livres = df_reduit.to_string(index=False)
                 
                 prompt = f"""
-                Tu es un bibliothécaire expert. Voici une sélection des livres disponibles dans ma bibliothèque :
+                Tu es un bibliothécaire expert. Voici la liste des livres de ma bibliothèque :
                 {contexte_livres}
                 
-                En te basant uniquement ou prioritairement sur cette liste, recommande 3 livres qui correspondent à la demande suivante : "{user_query}".
+                En te basant sur cette liste, recommande 3 livres qui correspondent à la demande suivante : "{user_query}".
                 Pour chaque livre, donne le titre, l'auteur et explique brièvement pourquoi il correspond à la demande.
                 """
                 
                 try:
-                    # Appel de l'IA via Groq avec le modèle Qwen validé
                     completion = client.chat.completions.create(
                         model="qwen/qwen3.8-27b",
                         messages=[{"role": "user", "content": prompt}],
@@ -64,4 +59,4 @@ if df_livres is not None:
         else:
             st.warning("Veuillez entrer une demande.")
 else:
-    st.error("Le fichier `livres.csv` est introuvable sur votre dépôt GitHub. Veuillez vous assurer qu'il est bien présent à la racine.")
+    st.error("Le fichier `livres.csv` est introuvable sur votre dépôt GitHub.")
