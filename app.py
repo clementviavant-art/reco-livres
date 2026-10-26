@@ -215,4 +215,3 @@ if st.button("Obtenir 3 recommandations", type="primary"):
 
         except Exception as e:
             st.error(f"Erreur Groq : {e}")
-```
