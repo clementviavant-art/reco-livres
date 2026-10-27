@@ -8,7 +8,6 @@ import groq
 import pandas as pd
 import streamlit as st
 from groq import Groq
-
 # Erreur de délai dépassé (repli sur APIError si le SDK ne l'expose pas)
 TIMEOUT_ERROR = getattr(groq, "APITimeoutError", groq.APIError)
 
