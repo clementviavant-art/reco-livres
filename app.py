@@ -1,12 +1,16 @@
 import os
 import random
 import re
+import time
 import unicodedata
 
 import groq
 import pandas as pd
 import streamlit as st
 from groq import Groq
+
+# Erreur de délai dépassé (repli sur APIError si le SDK ne l'expose pas)
+TIMEOUT_ERROR = getattr(groq, "APITimeoutError", groq.APIError)
 
 
 # ==================================================
@@ -36,14 +40,20 @@ def get_setting(name, default=""):
 # Le modèle peut être changé sans toucher au code (GROQ_MODEL dans les secrets).
 MODEL = get_setting("GROQ_MODEL", "qwen/qwen3.8-27b")
 
-# Réglage optionnel du raisonnement (ex. "none" ou "low"), à vérifier
-# dans la doc Groq pour ce modèle. Vide = comportement par défaut.
-REASONING_EFFORT = get_setting("GROQ_REASONING_EFFORT") or None
+# Mode de réflexion de Qwen 3.8 sur Groq :
+#   "none"                          -> mode « instruct » : rapide (conseillé ici)
+#   "low" / "medium" / "high" / "default" -> mode « thinking » : lent
+#   "off"                           -> n'envoie rien (autre modèle sans ce réglage)
+REASONING_EFFORT = get_setting("GROQ_REASONING_EFFORT", "none").strip().lower()
 
 CSV_FILE = "livres.csv"
 MAX_CATALOGUE_BOOKS = 3
 TOTAL_BOOKS = MAX_CATALOGUE_BOOKS + 1  # + 1 découverte hors catalogue
-MAX_TOKENS = 3000  # marge pour la phase de réflexion du modèle
+# Réponse courte en mode instruct ; marge pour la réflexion en mode thinking.
+MAX_TOKENS = 1500 if REASONING_EFFORT in ("none", "off") else 4000
+REQUEST_TIMEOUT = 40  # secondes, par appel à Groq
+TIME_BUDGET = 80  # secondes, pour l'ensemble d'une recherche
+MAX_RATE_LIMIT_WAIT = 10  # on n'attend une limite de débit que si elle est courte
 MAX_EXTERNAL_ATTEMPTS = 2
 DISCOVERY_COUNT = 2  # suggestions affichées à l'ouverture de la page
 DISCOVERY_SAMPLE_SIZE = 30  # livres tirés au hasard et soumis au modèle
@@ -157,8 +167,10 @@ def load_catalogue():
 
 @st.cache_resource
 def get_client(api_key):
-    """Client Groq créé une seule fois, avec timeout et nouvelles tentatives."""
-    return Groq(api_key=api_key, timeout=60, max_retries=2)
+    """Client Groq créé une seule fois, avec un timeout court."""
+    # max_retries=0 : les nouvelles tentatives sont gérées par l'application
+    # (sinon le SDK peut attendre longtemps en silence).
+    return Groq(api_key=api_key, timeout=REQUEST_TIMEOUT, max_retries=0)
 
 
 # ==================================================
@@ -248,22 +260,51 @@ SYSTEM_PROMPT = (
 )
 
 
+def reasoning_options():
+    """Paramètres de réflexion envoyés à Groq (voir REASONING_EFFORT)."""
+    if REASONING_EFFORT in ("", "off"):
+        return {}
+
+    options = {"reasoning_effort": REASONING_EFFORT}
+    if REASONING_EFFORT != "none":
+        options["reasoning_format"] = "hidden"  # ne renvoyer que la réponse
+    return options
+
+
+def retry_after_seconds(error):
+    """Délai conseillé par Groq après une erreur 429, s'il est indiqué."""
+    try:
+        return float(error.response.headers.get("retry-after"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def call_groq(prompt, max_tokens=MAX_TOKENS):
     """Envoie une demande à Groq. Renvoie (texte, finish_reason)."""
     kwargs = {}
-    if REASONING_EFFORT:
-        kwargs["extra_body"] = {"reasoning_effort": REASONING_EFFORT}
+    options = reasoning_options()
+    if options:
+        kwargs["extra_body"] = options
 
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.6,
-        max_completion_tokens=max_tokens,
-        **kwargs
-    )
+    for attempt in (1, 2):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.6,
+                max_completion_tokens=max_tokens,
+                **kwargs
+            )
+            break
+        except groq.RateLimitError as error:
+            wait = retry_after_seconds(error)
+            # Une seule nouvelle tentative, et seulement si l'attente est courte.
+            if attempt == 2 or wait is None or wait > MAX_RATE_LIMIT_WAIT:
+                raise
+            time.sleep(wait + 0.5)
 
     choice = response.choices[0]
     return strip_reasoning(choice.message.content or ""), choice.finish_reason
@@ -317,8 +358,10 @@ Pour la dernière recommandation (hors catalogue) :
 
 FORMAT DE RÉPONSE STRICT :
 {id_lines}
-EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
+EXTERIEUR: titre | auteur : Prénom Nom | raison : justification
 
+Pour la ligne EXTERIEUR, l'ordre est strict : le titre, puis « auteur : »
+suivi du nom de l'auteur, puis « raison : ».
 Remplace « identifiant » par un identifiant réellement présent
 dans le catalogue et recopie le titre exactement comme dans le
 catalogue. Commence chaque ligne par « ID: ».
@@ -383,7 +426,9 @@ CONSIGNES :
 - Ne reprends aucun des livres interdits.
 - Donne une raison courte et personnalisée.
 - Réponds sur une seule ligne avec exactement ce format :
-EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
+EXTERIEUR: titre | auteur : Prénom Nom | raison : justification
+- L'ordre est strict : le titre, puis « auteur : » suivi du nom de
+  l'auteur, puis « raison : ».
 - Aucun texte avant ou après cette ligne.
 """
 
@@ -400,12 +445,21 @@ CATALOGUE_LINE = re.compile(
     flags=re.IGNORECASE | re.MULTILINE
 )
 
+# Tolère : puces/gras, « EXTÉRIEUR » accentué, libellé « auteur : » absent.
 EXTERNAL_LINE = re.compile(
-    r"^\s*EXTERIEUR\s*:\s*(.+?)\s*\|\s*"
-    r"auteur\s*:\s*(.+?)\s*\|\s*"
+    r"^[\s\-*•>]*EXT[ÉE]RIEUR\s*:\s*(.+?)\s*\|\s*"
+    r"(?:auteur\s*:\s*)?(.+?)\s*\|\s*"
     r"raison\s*:\s*(.+?)\s*$",
     flags=re.IGNORECASE | re.MULTILINE
 )
+
+
+def clean_author(value):
+    """Retire les restes du format demandé que le modèle recopie parfois
+    (ex. « Gaël Faye : nom de l'auteur »)."""
+    value = re.sub(r"\s*:\s*nom de l['’]auteur\s*$", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(?:auteur|nom de l['’]auteur)\s*:\s*", "", value, flags=re.IGNORECASE)
+    return value.strip(" *[]\"«»")
 
 
 def parse_catalogue_recommendations(answer, exclude_ids=(), limit=None):
@@ -452,6 +506,8 @@ def parse_external_candidate(answer):
         return None
 
     title, author, reason = [v.strip() for v in match.groups()]
+    title = title.strip(" *[]\"«»")
+    author = clean_author(author)
 
     if not (title and author and reason):
         return None
@@ -477,16 +533,42 @@ def is_new_title(title, refused_titles=()):
 # LOGIQUE DE RECOMMANDATION
 # ==================================================
 
-def recommend_books(preferences, avoid):
+def recommend_books(preferences, avoid, progress=None):
+    progress = progress or (lambda message: None)
+    started = time.monotonic()
     logs = []
+    failed = False  # une erreur Groq a déjà eu lieu : on arrête les appels
 
-    def ask(label, prompt, max_tokens=MAX_TOKENS):
-        answer, finish_reason = call_groq(prompt, max_tokens)
-        note = " [réponse tronquée : max_tokens atteint]" if finish_reason == "length" else ""
+    def time_left():
+        return TIME_BUDGET - (time.monotonic() - started)
+
+    def ask(label, prompt):
+        answer, finish_reason = call_groq(prompt)
+        note = (
+            " [réponse tronquée : max_tokens atteint]"
+            if finish_reason == "length" else ""
+        )
         logs.append(f"{label}{note} :\n{answer or '(vide)'}")
         return answer
 
+    def ask_optional(label, prompt):
+        """Appel facultatif : en cas d'erreur ou de délai dépassé,
+        on garde ce qu'on a déjà au lieu de tout perdre."""
+        nonlocal failed
+
+        if failed or time_left() <= 0:
+            logs.append(f"{label} : ignoré (erreur ou délai de {TIME_BUDGET} s dépassé)")
+            return ""
+
+        try:
+            return ask(label, prompt)
+        except groq.APIError as error:
+            failed = True
+            logs.append(f"{label} : erreur Groq ({type(error).__name__}: {error})")
+            return ""
+
     # 1) Appel principal : livres du catalogue + livre extérieur
+    progress("1/3 · Analyse de la bibliothèque…")
     answer = ask("Réponse principale", build_main_prompt(preferences, avoid))
 
     catalogue_recs = parse_catalogue_recommendations(answer)
@@ -503,15 +585,15 @@ def recommend_books(preferences, avoid):
     # 2) Complète si des livres du catalogue manquent (ID inventé, doublon...)
     missing = MAX_CATALOGUE_BOOKS - len(catalogue_recs)
     if missing > 0:
-        extra_answer = ask(
+        progress(f"2/3 · Il manque {missing} livre(s) du catalogue, je complète…")
+        extra_answer = ask_optional(
             "Complément catalogue",
             build_completion_prompt(
                 preferences,
                 avoid,
                 [rec["id"] for rec in catalogue_recs],
                 missing
-            ),
-            max_tokens=MAX_TOKENS
+            )
         )
         catalogue_recs += parse_catalogue_recommendations(
             extra_answer,
@@ -523,16 +605,18 @@ def recommend_books(preferences, avoid):
     attempts = 0
     while external_rec is None and attempts < MAX_EXTERNAL_ATTEMPTS:
         attempts += 1
+        progress(f"3/3 · Recherche d'une découverte hors catalogue (essai {attempts})…")
 
         excluded = [rec["titre"] for rec in catalogue_recs] + refused_titles
-        fallback_answer = ask(
+        fallback_answer = ask_optional(
             f"Secours extérieur (essai {attempts})",
-            build_external_prompt(preferences, avoid, excluded),
-            max_tokens=MAX_TOKENS
+            build_external_prompt(preferences, avoid, excluded)
         )
 
         candidate = parse_external_candidate(fallback_answer)
         if not candidate:
+            if failed or time_left() <= 0:
+                break
             continue
 
         if is_new_title(candidate["titre"], refused_titles):
@@ -700,19 +784,29 @@ if submitted:
     else:
         st.session_state.pop("result", None)
 
-        with st.spinner(
-            "Analyse du catalogue et recherche de tes prochaines lectures..."
-        ):
+        with st.status(
+            "Recherche de tes prochaines lectures...", expanded=True
+        ) as status:
             try:
                 st.session_state["result"] = recommend_books(
-                    preferences, avoid
+                    preferences, avoid, progress=status.write
+                )
+                status.update(
+                    label="Recherche terminée", state="complete", expanded=False
                 )
             except groq.RateLimitError:
+                status.update(label="Limite d'utilisation atteinte", state="error")
                 st.error(
                     "Limite d'utilisation Groq atteinte. "
-                    "Réessaie dans un instant."
+                    "Réessaie dans une minute."
+                )
+            except TIMEOUT_ERROR:
+                status.update(label="Groq ne répond pas", state="error")
+                st.error(
+                    "Groq met trop de temps à répondre. Réessaie dans un instant."
                 )
             except groq.APIError as e:
+                status.update(label="Erreur Groq", state="error")
                 st.error(f"Une erreur est survenue avec Groq : {e}")
 
 # Le résultat reste affiché même après un autre clic sur la page.
