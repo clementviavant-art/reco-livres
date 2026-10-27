@@ -49,8 +49,23 @@ REASONING_EFFORT = get_setting("GROQ_REASONING_EFFORT", "none").strip().lower()
 CSV_FILE = "livres.csv"
 MAX_CATALOGUE_BOOKS = 3
 TOTAL_BOOKS = MAX_CATALOGUE_BOOKS + 1  # + 1 découverte hors catalogue
-# Réponse courte en mode instruct ; marge pour la réflexion en mode thinking.
-MAX_TOKENS = 1500 if REASONING_EFFORT in ("none", "off") else 4000
+# --- Budgets de tokens de SORTIE ---
+# L'offre gratuite de Groq limite les tokens de sortie par minute (1000 pour
+# ce modèle) et compte le max_tokens demandé : on reste donc au plus juste.
+# Les réponses attendues sont courtes (1 à 4 lignes).
+MAIN_TOKENS = 500        # 3 livres du catalogue + 1 découverte
+PER_BOOK_TOKENS = 120    # par livre manquant (complément)
+EXTERNAL_TOKENS = 200    # 1 livre hors catalogue
+DISCOVERY_TOKENS = 300   # 2 suggestions d'accueil
+
+# En mode « thinking », la réflexion consomme aussi des tokens de sortie.
+TOKEN_SCALE = 1 if REASONING_EFFORT in ("none", "off") else 4
+
+try:
+    # Plafond par requête. À relever si tu passes à une offre Groq supérieure.
+    OUTPUT_TOKEN_CAP = int(get_setting("GROQ_OUTPUT_TOKEN_CAP", "900"))
+except ValueError:
+    OUTPUT_TOKEN_CAP = 900
 REQUEST_TIMEOUT = 40  # secondes, par appel à Groq
 TIME_BUDGET = 80  # secondes, pour l'ensemble d'une recherche
 MAX_RATE_LIMIT_WAIT = 10  # on n'attend une limite de débit que si elle est courte
@@ -279,8 +294,9 @@ def retry_after_seconds(error):
         return None
 
 
-def call_groq(prompt, max_tokens=MAX_TOKENS):
+def call_groq(prompt, max_tokens=MAIN_TOKENS):
     """Envoie une demande à Groq. Renvoie (texte, finish_reason)."""
+    max_tokens = min(max_tokens * TOKEN_SCALE, OUTPUT_TOKEN_CAP)
     kwargs = {}
     options = reasoning_options()
     if options:
@@ -347,13 +363,15 @@ Tu dois fournir EXACTEMENT {n + 1} recommandations :
 Pour les {n} recommandations du catalogue :
 - Utilise uniquement les identifiants exacts du catalogue.
 - Ne recommande pas deux fois le même livre.
-- Explique brièvement pourquoi chaque livre correspond aux envies.
+- Explique pourquoi chaque livre correspond aux envies, en une phrase
+  de 25 mots maximum.
 
 Pour la dernière recommandation (hors catalogue) :
 - Choisis un livre réel, publié et pertinent.
 - Ne choisis aucun titre présent dans le catalogue.
 - Ne reprends aucun des {n} livres déjà recommandés.
-- Indique le titre, l'auteur et une justification courte.
+- Indique le titre, l'auteur et une justification d'une phrase
+  (25 mots maximum).
 - Cette recommandation est obligatoire.
 
 FORMAT DE RÉPONSE STRICT :
@@ -424,7 +442,7 @@ de la famille, ou déjà refusés) :
 CONSIGNES :
 - Choisis un livre réel dont tu connais le titre et l'auteur.
 - Ne reprends aucun des livres interdits.
-- Donne une raison courte et personnalisée.
+- Donne une raison personnalisée, en une phrase de 25 mots maximum.
 - Réponds sur une seule ligne avec exactement ce format :
 EXTERIEUR: titre | auteur : Prénom Nom | raison : justification
 - L'ordre est strict : le titre, puis « auteur : » suivi du nom de
@@ -542,8 +560,8 @@ def recommend_books(preferences, avoid, progress=None):
     def time_left():
         return TIME_BUDGET - (time.monotonic() - started)
 
-    def ask(label, prompt):
-        answer, finish_reason = call_groq(prompt)
+    def ask(label, prompt, max_tokens=MAIN_TOKENS):
+        answer, finish_reason = call_groq(prompt, max_tokens)
         note = (
             " [réponse tronquée : max_tokens atteint]"
             if finish_reason == "length" else ""
@@ -551,7 +569,7 @@ def recommend_books(preferences, avoid, progress=None):
         logs.append(f"{label}{note} :\n{answer or '(vide)'}")
         return answer
 
-    def ask_optional(label, prompt):
+    def ask_optional(label, prompt, max_tokens):
         """Appel facultatif : en cas d'erreur ou de délai dépassé,
         on garde ce qu'on a déjà au lieu de tout perdre."""
         nonlocal failed
@@ -561,7 +579,7 @@ def recommend_books(preferences, avoid, progress=None):
             return ""
 
         try:
-            return ask(label, prompt)
+            return ask(label, prompt, max_tokens)
         except groq.APIError as error:
             failed = True
             logs.append(f"{label} : erreur Groq ({type(error).__name__}: {error})")
@@ -593,7 +611,8 @@ def recommend_books(preferences, avoid, progress=None):
                 avoid,
                 [rec["id"] for rec in catalogue_recs],
                 missing
-            )
+            ),
+            PER_BOOK_TOKENS * missing + 80
         )
         catalogue_recs += parse_catalogue_recommendations(
             extra_answer,
@@ -610,7 +629,8 @@ def recommend_books(preferences, avoid, progress=None):
         excluded = [rec["titre"] for rec in catalogue_recs] + refused_titles
         fallback_answer = ask_optional(
             f"Secours extérieur (essai {attempts})",
-            build_external_prompt(preferences, avoid, excluded)
+            build_external_prompt(preferences, avoid, excluded),
+            EXTERNAL_TOKENS
         )
 
         candidate = parse_external_candidate(fallback_answer)
@@ -673,7 +693,8 @@ différents l'un de l'autre (genre, ambiance, époque ou style), pour
 donner deux envies de lecture contrastées.
 
 - Utilise uniquement les identifiants exacts de la liste.
-- Explique en une phrase pourquoi chaque livre donne envie d'être lu.
+- Explique en une phrase (25 mots maximum) pourquoi chaque livre
+  donne envie d'être lu.
 
 FORMAT DE RÉPONSE STRICT :
 {id_lines}
@@ -688,7 +709,7 @@ def get_discoveries():
     sample = sample_books(DISCOVERY_SAMPLE_SIZE)
 
     try:
-        answer, _ = call_groq(build_discovery_prompt(sample))
+        answer, _ = call_groq(build_discovery_prompt(sample), DISCOVERY_TOKENS)
         picks = parse_catalogue_recommendations(answer, limit=DISCOVERY_COUNT)
     except groq.APIError:
         picks = []
@@ -794,12 +815,15 @@ if submitted:
                 status.update(
                     label="Recherche terminée", state="complete", expanded=False
                 )
-            except groq.RateLimitError:
+            except groq.RateLimitError as e:
                 status.update(label="Limite d'utilisation atteinte", state="error")
                 st.error(
-                    "Limite d'utilisation Groq atteinte. "
-                    "Réessaie dans une minute."
+                    "Limite d'utilisation Groq atteinte (l'offre gratuite "
+                    "est plafonnée par minute). Attends une minute puis "
+                    "réessaie."
                 )
+                with st.expander("Détail de l'erreur"):
+                    st.code(str(e))
             except TIMEOUT_ERROR:
                 status.update(label="Groq ne répond pas", state="error")
                 st.error(
