@@ -1,23 +1,15 @@
-
 import os
 import re
 import unicodedata
-import streamlit as st
+
+import groq
 import pandas as pd
+import streamlit as st
 from groq import Groq
 
 
 # ==================================================
-# CONFIGURATION
-# ==================================================
-
-MODEL = "qwen/qwen3.8-27b"
-CSV_FILE = "livres.csv"
-MAX_CATALOGUE_BOOKS = 3
-
-
-# ==================================================
-# PAGE STREAMLIT
+# PAGE STREAMLIT (doit être la première commande st.*)
 # ==================================================
 
 st.set_page_config(
@@ -26,19 +18,70 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("Conseiller spécial pour la famille Viavant")
-st.write(
-    "Cloé, Gilberte, trouvez vos prochaines lectures parmi les livres, "
-    "avec en bonus une découverte extérieure à notre bibliothèque."
-)
+
+# ==================================================
+# CONFIGURATION
+# ==================================================
+
+def get_setting(name, default=""):
+    """Lit un réglage dans st.secrets, puis dans l'environnement."""
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        value = ""
+    return value or os.getenv(name, default)
+
+
+# Le modèle peut être changé sans toucher au code (GROQ_MODEL dans les secrets).
+MODEL = get_setting("GROQ_MODEL", "qwen/qwen3.8-27b")
+
+# Réglage optionnel du raisonnement (ex. "none" ou "low"), à vérifier
+# dans la doc Groq pour ce modèle. Vide = comportement par défaut.
+REASONING_EFFORT = get_setting("GROQ_REASONING_EFFORT") or None
+
+CSV_FILE = "livres.csv"
+MAX_CATALOGUE_BOOKS = 3
+TOTAL_BOOKS = MAX_CATALOGUE_BOOKS + 1  # + 1 découverte hors catalogue
+MAX_TOKENS = 3000  # marge pour la phase de réflexion du modèle
+MAX_EXTERNAL_ATTEMPTS = 2
 
 
 # ==================================================
-# CHARGEMENT DU CATALOGUE
+# OUTILS TEXTE
+# ==================================================
+
+def normalize_text(value):
+    """Normalise le texte pour comparer les titres."""
+    value = unicodedata.normalize("NFKD", str(value))
+    value = "".join(
+        char for char in value
+        if not unicodedata.combining(char)
+    )
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def clean_field(series):
+    """Neutralise les retours à la ligne et les '|' d'une colonne."""
+    return (
+        series
+        .str.replace("\n", " ", regex=False)
+        .str.replace("|", "/", regex=False)
+    )
+
+
+def strip_reasoning(text):
+    """Retire un éventuel bloc <think>, même s'il est tronqué."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
+# ==================================================
+# CHARGEMENT DU CATALOGUE (calculé une seule fois)
 # ==================================================
 
 @st.cache_data
-def load_books():
+def load_catalogue():
     df = pd.read_csv(
         CSV_FILE,
         sep=";",
@@ -61,17 +104,49 @@ def load_books():
     df["Auteur"] = df["Auteur"].str.strip()
     df["Titre du livre"] = df["Titre du livre"].str.strip()
 
-    df = df[df["Titre du livre"] != ""].copy()
-    df = df.reset_index(drop=True)
+    df = df[df["Titre du livre"] != ""].reset_index(drop=True)
 
     # Identifiant interne unique pour chaque livre
     df["_id"] = df.index.astype(str)
 
-    return df
+    # Texte du catalogue envoyé au modèle : construit une seule fois
+    text = "\n".join(
+        df["_id"]
+        + "|" + clean_field(df["Auteur"])
+        + "|" + clean_field(df["Titre du livre"])
+    )
 
+    return {
+        "count": len(df),
+        "text": text,
+        "by_id": {
+            book_id: {"id": book_id, "titre": title, "auteur": author}
+            for book_id, title, author in zip(
+                df["_id"], df["Titre du livre"], df["Auteur"]
+            )
+        },
+        "titles": {normalize_text(t) for t in df["Titre du livre"]},
+    }
+
+
+@st.cache_resource
+def get_client(api_key):
+    """Client Groq créé une seule fois, avec timeout et nouvelles tentatives."""
+    return Groq(api_key=api_key, timeout=60, max_retries=2)
+
+
+# ==================================================
+# INTERFACE : EN-TÊTE ET CHARGEMENT
+# ==================================================
+
+st.title("Conseiller spécial pour la famille Viavant")
+st.write(
+    "Cloé, Gilberte, trouvez vos prochaines lectures parmi les livres, "
+    "avec en bonus une découverte extérieure à notre bibliothèque."
+)
 
 try:
-    books = load_books()
+    catalogue = load_catalogue()
 except FileNotFoundError:
     st.error(
         "Fichier livres.csv introuvable. "
@@ -82,24 +157,13 @@ except Exception as e:
     st.error(f"Erreur de lecture du catalogue : {e}")
     st.stop()
 
-if books.empty:
+if catalogue["count"] == 0:
     st.error("Aucun livre trouvé dans le catalogue.")
     st.stop()
 
-st.caption(f"📖 {len(books)} livres dans ton catalogue.")
+st.caption(f"📖 {catalogue['count']} livres dans ton catalogue.")
 
-
-# ==================================================
-# CLÉ API GROQ
-# ==================================================
-
-try:
-    api_key = st.secrets.get("GROQ_API_KEY", "")
-except Exception:
-    api_key = ""
-
-if not api_key:
-    api_key = os.getenv("GROQ_API_KEY", "")
+api_key = get_setting("GROQ_API_KEY")
 
 if not api_key:
     st.error(
@@ -109,7 +173,7 @@ if not api_key:
     )
     st.stop()
 
-client = Groq(api_key=api_key)
+client = get_client(api_key)
 
 
 # ==================================================
@@ -139,132 +203,205 @@ with st.form("preferences_form"):
 
 
 # ==================================================
-# OUTILS
+# APPEL À GROQ
 # ==================================================
 
-def normalize_text(value):
-    """Normalise le texte pour comparer les titres."""
-    value = unicodedata.normalize("NFKD", str(value))
-    value = "".join(
-        char for char in value
-        if not unicodedata.combining(char)
-    )
-    return re.sub(r"\s+", " ", value).strip().casefold()
+SYSTEM_PROMPT = (
+    "Tu es un conseiller littéraire rigoureux. "
+    "Tu respectes le format de réponse demandé, "
+    "tu n'inventes pas de livres du catalogue "
+    "et tu distingues clairement les suggestions "
+    "issues du catalogue des suggestions extérieures."
+)
 
 
-def build_catalogue(df):
-    """Construit une liste compacte contenant tout le catalogue."""
-    lines = []
+def call_groq(prompt, max_tokens=MAX_TOKENS):
+    """Envoie une demande à Groq. Renvoie (texte, finish_reason)."""
+    kwargs = {}
+    if REASONING_EFFORT:
+        kwargs["extra_body"] = {"reasoning_effort": REASONING_EFFORT}
 
-    for _, book in df.iterrows():
-        author = book["Auteur"].replace("\n", " ").replace("|", "/")
-        title = book["Titre du livre"].replace("\n", " ").replace("|", "/")
-
-        lines.append(f'{book["_id"]}|{author}|{title}')
-
-    return "\n".join(lines)
-
-
-def call_groq(prompt, max_tokens=1200):
-    """Envoie une demande à Groq sans imposer le format JSON."""
     response = client.chat.completions.create(
         model=MODEL,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "Tu es un conseiller littéraire rigoureux. "
-                    "Tu respectes le format de réponse demandé, "
-                    "tu n'inventes pas de livres du catalogue "
-                    "et tu distingues clairement les suggestions "
-                    "issues du catalogue des suggestions extérieures."
-                )
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
         ],
         temperature=0.6,
-        max_completion_tokens=max_tokens
+        max_completion_tokens=max_tokens,
+        **kwargs
     )
 
-    return response.choices[0].message.content or ""
+    choice = response.choices[0]
+    return strip_reasoning(choice.message.content or ""), choice.finish_reason
 
 
 # ==================================================
-# PARSE DES RECOMMANDATIONS DU CATALOGUE
+# PROMPTS
 # ==================================================
 
-def parse_catalogue_recommendations(answer, df):
+def build_main_prompt(preferences, avoid):
+    n = MAX_CATALOGUE_BOOKS
+    avoid_text = avoid.strip() or "Rien de précisé"
+    id_lines = "\n".join(["ID: identifiant | raison : justification"] * n)
+
+    return f"""
+Tu es un conseiller littéraire.
+
+ENVIES DU LECTEUR :
+{preferences}
+
+LIVRES À ÉVITER :
+{avoid_text}
+
+CATALOGUE COMPLET :
+ID|Auteur|Titre
+{catalogue["text"]}
+
+MISSION OBLIGATOIRE :
+Tu dois fournir EXACTEMENT {n + 1} recommandations :
+- {n} livres présents dans le catalogue ;
+- 1 livre réel, absent du catalogue, pour faire découvrir
+  une nouvelle lecture au lecteur.
+
+Pour les {n} recommandations du catalogue :
+- Utilise uniquement les identifiants exacts du catalogue.
+- Ne recommande pas deux fois le même livre.
+- Explique brièvement pourquoi chaque livre correspond aux envies.
+
+Pour la dernière recommandation (hors catalogue) :
+- Choisis un livre réel, publié et pertinent.
+- Ne choisis aucun titre présent dans le catalogue.
+- Ne reprends aucun des {n} livres déjà recommandés.
+- Indique le titre, l'auteur et une justification courte.
+- Cette recommandation est obligatoire.
+
+FORMAT DE RÉPONSE STRICT :
+{id_lines}
+EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
+
+Remplace « identifiant » par un identifiant réellement présent
+dans le catalogue.
+Ne fournis ni introduction, ni conclusion, ni autre ligne.
+"""
+
+
+def build_completion_prompt(preferences, avoid, kept_ids, missing):
+    """Demande les livres du catalogue qui manquent."""
+    avoid_text = avoid.strip() or "Rien de précisé"
+    id_lines = "\n".join(["ID: identifiant | raison : justification"] * missing)
+    kept = ", ".join(kept_ids) or "aucun"
+
+    return f"""
+Tu es un conseiller littéraire.
+
+ENVIES DU LECTEUR :
+{preferences}
+
+LIVRES À ÉVITER :
+{avoid_text}
+
+CATALOGUE COMPLET :
+ID|Auteur|Titre
+{catalogue["text"]}
+
+Identifiants déjà retenus (à ne pas reprendre) : {kept}
+
+Choisis EXACTEMENT {missing} autre(s) livre(s) du catalogue,
+avec des identifiants exacts, différents de ceux déjà retenus.
+
+FORMAT DE RÉPONSE STRICT :
+{id_lines}
+
+Ne fournis ni introduction, ni conclusion, ni autre ligne.
+"""
+
+
+def build_external_prompt(preferences, avoid, excluded_titles):
+    """Demande uniquement le livre extérieur (le catalogue n'est pas
+    renvoyé : la vérification est faite en Python)."""
+    avoid_text = avoid.strip() or "Rien de précisé"
+    excluded = "\n".join(f"- {t}" for t in excluded_titles) or "- Aucun"
+
+    return f"""
+Tu es un conseiller littéraire.
+
+Tu dois proposer UN SEUL livre réel, publié et pertinent.
+
+ENVIES DU LECTEUR :
+{preferences}
+
+LIVRES À ÉVITER :
+{avoid_text}
+
+LIVRES INTERDITS (déjà recommandés, déjà dans la bibliothèque
+de la famille, ou déjà refusés) :
+{excluded}
+
+CONSIGNES :
+- Choisis un livre réel dont tu connais le titre et l'auteur.
+- Ne reprends aucun des livres interdits.
+- Donne une raison courte et personnalisée.
+- Réponds sur une seule ligne avec exactement ce format :
+EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
+- Aucun texte avant ou après cette ligne.
+"""
+
+
+# ==================================================
+# PARSING DES RÉPONSES
+# ==================================================
+
+CATALOGUE_LINE = re.compile(
+    r"^\s*ID\s*:\s*(\d+)\s*\|\s*raison\s*:\s*(.+?)\s*$",
+    flags=re.IGNORECASE | re.MULTILINE
+)
+
+EXTERNAL_LINE = re.compile(
+    r"^\s*EXTERIEUR\s*:\s*(.+?)\s*\|\s*"
+    r"auteur\s*:\s*(.+?)\s*\|\s*"
+    r"raison\s*:\s*(.+?)\s*$",
+    flags=re.IGNORECASE | re.MULTILINE
+)
+
+
+def parse_catalogue_recommendations(answer, exclude_ids=(), limit=None):
     """Ne conserve que les identifiants réellement présents dans le CSV."""
-    books_by_id = df.set_index("_id", drop=False)
+    limit = limit or MAX_CATALOGUE_BOOKS
+    seen_ids = set(exclude_ids)
     recommendations = []
-    seen_ids = set()
 
-    pattern = re.compile(
-        r"^\s*ID\s*:\s*(\d+)\s*\|\s*raison\s*:\s*(.+?)\s*$",
-        flags=re.IGNORECASE | re.MULTILINE
-    )
-
-    for book_id, reason in pattern.findall(answer):
-        if book_id not in books_by_id.index:
-            continue
-
-        if book_id in seen_ids:
+    for book_id, reason in CATALOGUE_LINE.findall(answer):
+        if book_id in seen_ids or book_id not in catalogue["by_id"]:
             continue
 
         seen_ids.add(book_id)
-        book = books_by_id.loc[book_id]
+        book = catalogue["by_id"][book_id]
 
         recommendations.append({
-            "titre": book["Titre du livre"],
-            "auteur": book["Auteur"],
+            "id": book_id,
+            "titre": book["titre"],
+            "auteur": book["auteur"],
             "raison": reason.strip(),
             "exterieur": False
         })
 
-        if len(recommendations) >= MAX_CATALOGUE_BOOKS:
+        if len(recommendations) >= limit:
             break
 
     return recommendations
 
 
-# ==================================================
-# PARSE DE LA RECOMMANDATION EXTÉRIEURE
-# ==================================================
-
-def parse_external_recommendation(answer, df):
-    """Récupère une recommandation extérieure et vérifie son titre."""
-
-    # Format attendu :
-    # EXTERIEUR: Titre | auteur : Nom | raison : Justification
-    pattern = re.compile(
-        r"^\s*EXTERIEUR\s*:\s*(.+?)\s*\|\s*"
-        r"auteur\s*:\s*(.+?)\s*\|\s*"
-        r"raison\s*:\s*(.+?)\s*$",
-        flags=re.IGNORECASE | re.MULTILINE
-    )
-
-    match = pattern.search(answer)
+def parse_external_candidate(answer):
+    """Extrait la ligne EXTERIEUR (sans encore valider le titre)."""
+    match = EXTERNAL_LINE.search(answer)
 
     if not match:
         return None
 
-    title, author, reason = [
-        value.strip() for value in match.groups()
-    ]
+    title, author, reason = [v.strip() for v in match.groups()]
 
-    if not title or not author or not reason:
-        return None
-
-    # Refuse un livre déjà présent dans le catalogue
-    catalogue_titles = {
-        normalize_text(value)
-        for value in df["Titre du livre"]
-    }
-
-    if normalize_text(title) in catalogue_titles:
+    if not (title and author and reason):
         return None
 
     return {
@@ -275,216 +412,148 @@ def parse_external_recommendation(answer, df):
     }
 
 
-# ==================================================
-# RECOMMANDATION DE SECOURS
-# ==================================================
-
-def get_external_fallback(preferences, avoid, df, existing_titles):
-    """
-    Si la première réponse oublie le livre extérieur,
-    effectue une seconde demande dédiée à cette recommandation.
-    """
-
-    catalogue = build_catalogue(df)
-
-    existing = "\n".join(
-        f"- {title}" for title in existing_titles
-    ) or "- Aucun"
-
-    prompt = f"""
-Tu es un conseiller littéraire.
-
-Tu dois proposer UN SEUL livre réel, publié et pertinent.
-
-Envies du lecteur :
-{preferences}
-
-Livres à éviter :
-{avoid if avoid.strip() else "Rien de précisé"}
-
-Livres déjà recommandés :
-{existing}
-
-Voici le catalogue COMPLET. Le livre choisi doit être absent
-de ce catalogue.
-
-ID|Auteur|Titre
-{catalogue}
-
-CONSIGNES :
-- Choisis un livre réel dont tu connais le titre et l'auteur.
-- Vérifie qu'il n'est pas dans le catalogue ni dans les livres
-  déjà recommandés.
-- Ne reprends aucun des livres déjà proposés.
-- Donne une raison courte et personnalisée.
-- Réponds sur une seule ligne avec exactement ce format :
-EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
-- Aucun texte avant ou après cette ligne.
-"""
-
-    answer = call_groq(prompt, max_tokens=500)
-
-    return answer
-
-
-# ==================================================
-# DEMANDE PRINCIPALE
-# ==================================================
-
-def recommend_books(preferences, avoid, df):
-    catalogue = build_catalogue(df)
-
-    prompt = f"""
-Tu es un conseiller littéraire.
-
-ENVIES DU LECTEUR :
-{preferences}
-
-LIVRES À ÉVITER :
-{avoid if avoid.strip() else "Rien de précisé"}
-
-CATALOGUE COMPLET :
-ID|Auteur|Titre
-{catalogue}
-
-MISSION OBLIGATOIRE :
-Tu dois fournir EXACTEMENT 4 recommandations :
-1. Un premier livre présent dans le catalogue.
-2. Un deuxième livre présent dans le catalogue.
-3. Un troisième livre présent dans le catalogue.
-4. Un livre réel, absent du catalogue, pour faire découvrir
-   une nouvelle lecture au lecteur.
-
-Pour les trois premières recommandations :
-- Utilise uniquement les identifiants exacts du catalogue.
-- Ne recommande pas deux fois le même livre.
-- Explique brièvement pourquoi chaque livre correspond aux envies.
-
-Pour la quatrième recommandation :
-- Choisis un livre réel, publié et pertinent.
-- Ne choisis aucun titre présent dans le catalogue.
-- Ne reprends aucun des trois livres déjà recommandés.
-- Indique le titre, l'auteur et une justification courte.
-- Cette quatrième recommandation est obligatoire.
-
-FORMAT DE RÉPONSE STRICT :
-ID: identifiant | raison : justification
-ID: identifiant | raison : justification
-ID: identifiant | raison : justification
-EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
-
-Remplace « identifiant » par un identifiant réellement présent
-dans le catalogue.
-Ne fournis ni introduction, ni conclusion, ni autre ligne.
-"""
-
-    # Premier appel : 3 livres du catalogue + 1 livre extérieur
-    answer = call_groq(prompt)
-
-    catalogue_recommendations = parse_catalogue_recommendations(
-        answer, df
+def is_new_title(title, refused_titles=()):
+    """Vrai si le titre n'est ni dans le catalogue ni déjà refusé."""
+    normalized = normalize_text(title)
+    return (
+        normalized not in catalogue["titles"]
+        and normalized not in {normalize_text(t) for t in refused_titles}
     )
 
-    external_recommendation = parse_external_recommendation(
-        answer, df
-    )
 
-    # Secours : si l'IA a oublié la recommandation extérieure,
-    # on lui demande une recommandation séparée.
-    if external_recommendation is None:
-        existing_titles = [
-            book["titre"] for book in catalogue_recommendations
-        ]
+# ==================================================
+# LOGIQUE DE RECOMMANDATION
+# ==================================================
 
-        fallback_answer = get_external_fallback(
-            preferences,
-            avoid,
-            df,
-            existing_titles
+def recommend_books(preferences, avoid):
+    logs = []
+
+    def ask(label, prompt, max_tokens=MAX_TOKENS):
+        answer, finish_reason = call_groq(prompt, max_tokens)
+        note = " [réponse tronquée : max_tokens atteint]" if finish_reason == "length" else ""
+        logs.append(f"{label}{note} :\n{answer or '(vide)'}")
+        return answer
+
+    # 1) Appel principal : livres du catalogue + livre extérieur
+    answer = ask("Réponse principale", build_main_prompt(preferences, avoid))
+
+    catalogue_recs = parse_catalogue_recommendations(answer)
+    external_rec = None
+    refused_titles = []
+
+    candidate = parse_external_candidate(answer)
+    if candidate:
+        if is_new_title(candidate["titre"]):
+            external_rec = candidate
+        else:
+            refused_titles.append(candidate["titre"])
+
+    # 2) Complète si des livres du catalogue manquent (ID inventé, doublon...)
+    missing = MAX_CATALOGUE_BOOKS - len(catalogue_recs)
+    if missing > 0:
+        extra_answer = ask(
+            "Complément catalogue",
+            build_completion_prompt(
+                preferences,
+                avoid,
+                [rec["id"] for rec in catalogue_recs],
+                missing
+            ),
+            max_tokens=MAX_TOKENS
+        )
+        catalogue_recs += parse_catalogue_recommendations(
+            extra_answer,
+            exclude_ids=[rec["id"] for rec in catalogue_recs],
+            limit=missing
         )
 
-        external_recommendation = parse_external_recommendation(
-            fallback_answer, df
+    # 3) Secours : demande dédiée pour le livre extérieur (2 essais max)
+    attempts = 0
+    while external_rec is None and attempts < MAX_EXTERNAL_ATTEMPTS:
+        attempts += 1
+
+        excluded = [rec["titre"] for rec in catalogue_recs] + refused_titles
+        fallback_answer = ask(
+            f"Secours extérieur (essai {attempts})",
+            build_external_prompt(preferences, avoid, excluded),
+            max_tokens=MAX_TOKENS
         )
 
-        # Conserve les réponses brutes pour aider au diagnostic.
-        diagnostic = (
-            "Réponse principale de l'IA :\n"
-            + answer
-            + "\n\nRéponse à la demande de secours :\n"
-            + fallback_answer
-        )
-    else:
-        diagnostic = answer
+        candidate = parse_external_candidate(fallback_answer)
+        if not candidate:
+            continue
 
-    recommendations = catalogue_recommendations.copy()
+        if is_new_title(candidate["titre"], refused_titles):
+            external_rec = candidate
+        else:
+            refused_titles.append(candidate["titre"])
 
-    if external_recommendation:
-        recommendations.append(external_recommendation)
+    recommendations = catalogue_recs
+    if external_rec:
+        recommendations.append(external_rec)
 
-    return recommendations, diagnostic
+    return recommendations, "\n\n".join(logs)
 
 
 # ==================================================
 # AFFICHAGE
 # ==================================================
 
+def show_result(recommendations, diagnostic):
+    catalogue_count = sum(not b["exterieur"] for b in recommendations)
+    external_count = sum(b["exterieur"] for b in recommendations)
+
+    if len(recommendations) == TOTAL_BOOKS:
+        st.success(f"Voici tes {TOTAL_BOOKS} recommandations !")
+    else:
+        st.warning(
+            f"J'ai obtenu {catalogue_count} recommandation(s) "
+            f"du catalogue et {external_count} recommandation(s) "
+            "extérieure(s). La réponse de l'IA est incomplète."
+        )
+
+    if recommendations:
+        st.subheader("📚 Voici ma sélection")
+
+        for index, book in enumerate(recommendations, start=1):
+            if book["exterieur"]:
+                st.markdown(f"### {index}. 🌟 {book['titre']}")
+                st.caption("Découverte hors catalogue")
+            else:
+                st.markdown(f"### {index}. {book['titre']}")
+                st.caption("Issu de ton catalogue")
+
+            st.write(f"**Auteur :** {book['auteur']}")
+            st.write(book["raison"])
+            st.divider()
+
+    # Réponses brutes affichées uniquement en cas de problème.
+    if len(recommendations) != TOTAL_BOOKS:
+        with st.expander("Diagnostic : voir la réponse brute de l'IA"):
+            st.code(diagnostic)
+
+
 if submitted:
     if not preferences.strip():
         st.warning("Décris tes envies de lecture avant de lancer la recherche.")
-        st.stop()
+    else:
+        st.session_state.pop("result", None)
 
-    with st.spinner(
-        "Analyse du catalogue et recherche de tes prochaines lectures..."
-    ):
-        try:
-            recommendations, diagnostic = recommend_books(
-                preferences,
-                avoid,
-                books
-            )
-
-            catalogue_count = sum(
-                not book["exterieur"] for book in recommendations
-            )
-            external_count = sum(
-                book["exterieur"] for book in recommendations
-            )
-
-            if len(recommendations) == 4:
-                st.success("Voici tes 4 recommandations !")
-            else:
-                st.warning(
-                    f"J'ai obtenu {catalogue_count} recommandation(s) "
-                    f"du catalogue et {external_count} recommandation(s) "
-                    "extérieure(s). La réponse de l'IA est incomplète."
+        with st.spinner(
+            "Analyse du catalogue et recherche de tes prochaines lectures..."
+        ):
+            try:
+                st.session_state["result"] = recommend_books(
+                    preferences, avoid
                 )
+            except groq.RateLimitError:
+                st.error(
+                    "Limite d'utilisation Groq atteinte. "
+                    "Réessaie dans un instant."
+                )
+            except groq.APIError as e:
+                st.error(f"Une erreur est survenue avec Groq : {e}")
 
-            if recommendations:
-                st.subheader("📚 Voici ma sélection")
-
-                for index, book in enumerate(recommendations, start=1):
-                    if book["exterieur"]:
-                        st.markdown(
-                            f"### {index}. 🌟 {book['titre']}"
-                        )
-                        st.caption("Découverte hors catalogue")
-                    else:
-                        st.markdown(
-                            f"### {index}. {book['titre']}"
-                        )
-                        st.caption("Issu de ton catalogue")
-
-                    st.write(f"**Auteur :** {book['auteur']}")
-                    st.write(book["raison"])
-                    st.divider()
-
-            # Affiche les réponses brutes uniquement en cas de problème.
-            if len(recommendations) != 4:
-                with st.expander(
-                    "Diagnostic : voir la réponse brute de l'IA"
-                ):
-                    st.code(diagnostic)
-
-        except Exception as e:
-            st.error(f"Une erreur est survenue avec Groq : {e}")
+# Le résultat reste affiché même après un autre clic sur la page.
+if "result" in st.session_state:
+    show_result(*st.session_state["result"])
