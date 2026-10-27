@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import unicodedata
 
@@ -44,6 +45,8 @@ MAX_CATALOGUE_BOOKS = 3
 TOTAL_BOOKS = MAX_CATALOGUE_BOOKS + 1  # + 1 découverte hors catalogue
 MAX_TOKENS = 3000  # marge pour la phase de réflexion du modèle
 MAX_EXTERNAL_ATTEMPTS = 2
+DISCOVERY_COUNT = 2  # suggestions affichées à l'ouverture de la page
+DISCOVERY_SAMPLE_SIZE = 30  # livres tirés au hasard et soumis au modèle
 
 
 # ==================================================
@@ -109,20 +112,26 @@ def load_catalogue():
     # Identifiant interne unique pour chaque livre
     df["_id"] = df.index.astype(str)
 
-    # Texte du catalogue envoyé au modèle : construit une seule fois
-    text = "\n".join(
+    # Lignes du catalogue envoyées au modèle : construites une seule fois
+    lines = (
         df["_id"]
         + "|" + clean_field(df["Auteur"])
         + "|" + clean_field(df["Titre du livre"])
     )
+    text = "\n".join(lines)
 
     return {
         "count": len(df),
         "text": text,
         "by_id": {
-            book_id: {"id": book_id, "titre": title, "auteur": author}
-            for book_id, title, author in zip(
-                df["_id"], df["Titre du livre"], df["Auteur"]
+            book_id: {
+                "id": book_id,
+                "titre": title,
+                "auteur": author,
+                "ligne": line,
+            }
+            for book_id, title, author, line in zip(
+                df["_id"], df["Titre du livre"], df["Auteur"], lines
             )
         },
         "titles": {normalize_text(t) for t in df["Titre du livre"]},
@@ -174,6 +183,13 @@ if not api_key:
     st.stop()
 
 client = get_client(api_key)
+
+
+# ==================================================
+# ZONE DES SUGGESTIONS D'ACCUEIL (remplie plus bas)
+# ==================================================
+
+suggestions_box = st.container()
 
 
 # ==================================================
@@ -496,6 +512,96 @@ def recommend_books(preferences, avoid):
 
 
 # ==================================================
+# SUGGESTIONS D'ACCUEIL (2 livres différents)
+# ==================================================
+
+def sample_books(size):
+    """Tire des livres au hasard, un seul par auteur pour varier."""
+    books = list(catalogue["by_id"].values())
+    random.shuffle(books)
+
+    picked, authors = [], set()
+    for book in books:
+        author = normalize_text(book["auteur"])
+        if author in authors:
+            continue
+        authors.add(author)
+        picked.append(book)
+        if len(picked) >= size:
+            break
+
+    # Catalogue avec très peu d'auteurs : on complète sans contrainte.
+    if len(picked) < DISCOVERY_COUNT:
+        picked = books[:size]
+
+    return picked
+
+
+def build_discovery_prompt(sample):
+    lines = "\n".join(book["ligne"] for book in sample)
+    id_lines = "\n".join(
+        ["ID: identifiant | raison : justification"] * DISCOVERY_COUNT
+    )
+
+    return f"""
+Tu es un conseiller littéraire.
+
+Voici une sélection aléatoire de livres de la bibliothèque familiale :
+ID|Auteur|Titre
+{lines}
+
+Choisis EXACTEMENT {DISCOVERY_COUNT} livres de cette liste, relativement
+différents l'un de l'autre (genre, ambiance, époque ou style), pour
+donner deux envies de lecture contrastées.
+
+- Utilise uniquement les identifiants exacts de la liste.
+- Explique en une phrase pourquoi chaque livre donne envie d'être lu.
+
+FORMAT DE RÉPONSE STRICT :
+{id_lines}
+
+Ne fournis ni introduction, ni conclusion, ni autre ligne.
+"""
+
+
+def get_discoveries():
+    """Renvoie 2 livres du catalogue, d'auteurs différents.
+    Si Groq échoue, on complète au hasard : la page reste utilisable."""
+    sample = sample_books(DISCOVERY_SAMPLE_SIZE)
+
+    try:
+        answer, _ = call_groq(build_discovery_prompt(sample))
+        picks = parse_catalogue_recommendations(answer, limit=DISCOVERY_COUNT)
+    except groq.APIError:
+        picks = []
+
+    chosen = []
+    for pick in picks:
+        author = normalize_text(pick["auteur"])
+        if all(author != normalize_text(c["auteur"]) for c in chosen):
+            chosen.append(pick)
+
+    # Complément aléatoire (sans justification) si besoin
+    for book in sample:
+        if len(chosen) >= DISCOVERY_COUNT:
+            break
+        author = normalize_text(book["auteur"])
+        if book["id"] in {c["id"] for c in chosen}:
+            continue
+        if any(author == normalize_text(c["auteur"]) for c in chosen):
+            continue
+        chosen.append({
+            "id": book["id"],
+            "titre": book["titre"],
+            "auteur": book["auteur"],
+            "raison": "",
+            "exterieur": False
+        })
+
+    return chosen
+
+
+# ==================================================
 # AFFICHAGE
 # ==================================================
 
@@ -531,6 +637,27 @@ def show_result(recommendations, diagnostic):
     if len(recommendations) != TOTAL_BOOKS:
         with st.expander("Diagnostic : voir la réponse brute de l'IA"):
             st.code(diagnostic)
+
+
+with suggestions_box:
+    st.subheader("✨ Pour commencer : deux idées de la bibliothèque")
+
+    reroll = st.button("🔄 Autres idées")
+
+    if reroll or "discoveries" not in st.session_state:
+        with st.spinner("Je feuillette les étagères..."):
+            st.session_state["discoveries"] = get_discoveries()
+
+    for column, book in zip(
+        st.columns(DISCOVERY_COUNT), st.session_state["discoveries"]
+    ):
+        with column, st.container(border=True):
+            st.markdown(f"**{book['titre']}**")
+            st.caption(book["auteur"])
+            if book["raison"]:
+                st.write(book["raison"])
+
+    st.divider()
 
 
 if submitted:
