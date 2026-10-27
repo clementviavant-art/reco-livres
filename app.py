@@ -46,6 +46,7 @@ MODEL = get_setting("GROQ_MODEL", "qwen/qwen3.8-27b")
 #   "off"                           -> n'envoie rien (autre modèle sans ce réglage)
 REASONING_EFFORT = get_setting("GROQ_REASONING_EFFORT", "none").strip().lower()
 
+APP_VERSION = "7"  # affichée sous le titre : permet de voir quel fichier tourne
 CSV_FILE = "livres.csv"
 MAX_CATALOGUE_BOOKS = 3
 TOTAL_BOOKS = MAX_CATALOGUE_BOOKS + 1  # + 1 découverte hors catalogue
@@ -214,7 +215,10 @@ if catalogue["count"] == 0:
     st.error("Aucun livre trouvé dans le catalogue.")
     st.stop()
 
-st.caption(f"📖 {catalogue['count']} livres dans ton catalogue.")
+st.caption(
+    f"📖 {catalogue['count']} livres dans ton catalogue · "
+    f"version {APP_VERSION} · modèle {MODEL}"
+)
 
 api_key = get_setting("GROQ_API_KEY")
 
@@ -744,6 +748,14 @@ def get_discoveries():
 # AFFICHAGE
 # ==================================================
 
+def bordered_container():
+    """Carte avec bordure ; repli sans bordure sur d'anciennes versions."""
+    try:
+        return st.container(border=True)
+    except TypeError:
+        return st.container()
+
+
 def show_result(recommendations, diagnostic):
     catalogue_count = sum(not b["exterieur"] for b in recommendations)
     external_count = sum(b["exterieur"] for b in recommendations)
@@ -781,20 +793,24 @@ def show_result(recommendations, diagnostic):
 with suggestions_box:
     st.subheader("✨ Pour commencer : deux idées de la bibliothèque")
 
-    reroll = st.button("🔄 Autres idées")
+    try:
+        reroll = st.button("🔄 Autres idées")
 
-    if reroll or "discoveries" not in st.session_state:
-        with st.spinner("Je feuillette les étagères..."):
-            st.session_state["discoveries"] = get_discoveries()
+        if reroll or "discoveries" not in st.session_state:
+            with st.spinner("Je feuillette les étagères..."):
+                st.session_state["discoveries"] = get_discoveries()
 
-    for column, book in zip(
-        st.columns(DISCOVERY_COUNT), st.session_state["discoveries"]
-    ):
-        with column, st.container(border=True):
-            st.markdown(f"**{book['titre']}**")
-            st.caption(book["auteur"])
-            if book["raison"]:
-                st.write(book["raison"])
+        for column, book in zip(
+            st.columns(DISCOVERY_COUNT), st.session_state["discoveries"]
+        ):
+            with column:
+                with bordered_container():
+                    st.markdown(f"**{book['titre']}**")
+                    st.caption(book["auteur"])
+                    if book["raison"]:
+                        st.write(book["raison"])
+    except Exception as e:
+        st.warning(f"Impossible d'afficher les suggestions : {e}")
 
     st.divider()
 
