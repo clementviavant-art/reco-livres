@@ -63,6 +63,18 @@ def normalize_text(value):
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
+def title_key(title):
+    """Clé de comparaison d'un titre tel que le modèle le voit dans le prompt."""
+    return normalize_text(str(title).replace("|", "/"))
+
+
+def titles_match(a, b):
+    """Vrai si deux titres sont identiques, à la casse, aux accents
+    ou à un sous-titre près."""
+    a, b = title_key(a), title_key(b)
+    return bool(a) and bool(b) and (a == b or a in b or b in a)
+
+
 def clean_field(series):
     """Neutralise les retours à la ligne et les '|' d'une colonne."""
     return (
@@ -120,6 +132,10 @@ def load_catalogue():
     )
     text = "\n".join(lines)
 
+    id_by_title = {}
+    for book_id, title in zip(df["_id"], df["Titre du livre"]):
+        id_by_title.setdefault(title_key(title), book_id)
+
     return {
         "count": len(df),
         "text": text,
@@ -134,6 +150,7 @@ def load_catalogue():
                 df["_id"], df["Titre du livre"], df["Auteur"], lines
             )
         },
+        "id_by_title": id_by_title,
         "titles": {normalize_text(t) for t in df["Titre du livre"]},
     }
 
@@ -256,10 +273,16 @@ def call_groq(prompt, max_tokens=MAX_TOKENS):
 # PROMPTS
 # ==================================================
 
+def format_lines(n):
+    """Lignes d'exemple du format demandé pour les livres du catalogue."""
+    line = "ID: identifiant | titre : titre exact | raison : justification"
+    return "\n".join([line] * n)
+
+
 def build_main_prompt(preferences, avoid):
     n = MAX_CATALOGUE_BOOKS
     avoid_text = avoid.strip() or "Rien de précisé"
-    id_lines = "\n".join(["ID: identifiant | raison : justification"] * n)
+    id_lines = format_lines(n)
 
     return f"""
 Tu es un conseiller littéraire.
@@ -297,7 +320,8 @@ FORMAT DE RÉPONSE STRICT :
 EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
 
 Remplace « identifiant » par un identifiant réellement présent
-dans le catalogue.
+dans le catalogue et recopie le titre exactement comme dans le
+catalogue. Commence chaque ligne par « ID: ».
 Ne fournis ni introduction, ni conclusion, ni autre ligne.
 """
 
@@ -305,7 +329,7 @@ Ne fournis ni introduction, ni conclusion, ni autre ligne.
 def build_completion_prompt(preferences, avoid, kept_ids, missing):
     """Demande les livres du catalogue qui manquent."""
     avoid_text = avoid.strip() or "Rien de précisé"
-    id_lines = "\n".join(["ID: identifiant | raison : justification"] * missing)
+    id_lines = format_lines(missing)
     kept = ", ".join(kept_ids) or "aucun"
 
     return f"""
@@ -368,8 +392,11 @@ EXTERIEUR: titre | auteur : nom de l'auteur | raison : justification
 # PARSING DES RÉPONSES
 # ==================================================
 
+# Tolère : puces/gras éventuels, préfixe « ID: » absent, titre facultatif.
 CATALOGUE_LINE = re.compile(
-    r"^\s*ID\s*:\s*(\d+)\s*\|\s*raison\s*:\s*(.+?)\s*$",
+    r"^[\s\-*•>]*(?:ID\s*:?\s*)?(\d+)\s*\*{0,2}\s*\|\s*"
+    r"(?:titre\s*:\s*(.+?)\s*\|\s*)?"
+    r"raison\s*:\s*(.+?)\s*$",
     flags=re.IGNORECASE | re.MULTILINE
 )
 
@@ -387,7 +414,16 @@ def parse_catalogue_recommendations(answer, exclude_ids=(), limit=None):
     seen_ids = set(exclude_ids)
     recommendations = []
 
-    for book_id, reason in CATALOGUE_LINE.findall(answer):
+    for book_id, title, reason in CATALOGUE_LINE.findall(answer):
+        # Si le modèle a donné un titre, il doit correspondre à l'ID.
+        # Sinon on se fie au titre (plus fiable pour un LLM qu'un numéro).
+        if title:
+            expected = catalogue["by_id"].get(book_id)
+            if expected is None or not titles_match(expected["titre"], title):
+                book_id = catalogue["id_by_title"].get(title_key(title))
+                if book_id is None:
+                    continue
+
         if book_id in seen_ids or book_id not in catalogue["by_id"]:
             continue
 
@@ -539,9 +575,7 @@ def sample_books(size):
 
 def build_discovery_prompt(sample):
     lines = "\n".join(book["ligne"] for book in sample)
-    id_lines = "\n".join(
-        ["ID: identifiant | raison : justification"] * DISCOVERY_COUNT
-    )
+    id_lines = format_lines(DISCOVERY_COUNT)
 
     return f"""
 Tu es un conseiller littéraire.
